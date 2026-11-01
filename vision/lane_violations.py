@@ -2,21 +2,26 @@
 
     python lane_violations.py --source video.mp4 --out lane_out
 
-1. Lane lines are found in the picture itself: frames spread over the video are aligned to the first one
-   (surveillance/camera_motion.py, vehicles masked out), their median is a picture of the empty road, and the
-   painted lines are traced in it row by row (thin bright paint, curves allowed). A line whose paint covers most of
-   its length is SOLID, otherwise BROKEN (dashed). The outermost lines are the road edges.
+1. Lane lines are found in the picture itself. The road is locked to one view (--ref-at, default the middle of the
+   video): frames spread over the whole video are matched to it (surveillance/camera_motion.py, vehicles masked out)
+   and warped into it, i.e. stabilised on the road; their median is a picture of the empty road, and the painted
+   lines are traced in it row by row (thin bright paint, curves allowed). Only lines running toward the road's
+   vanishing point are kept (not people on the pavement). A stretch whose paint covers most of its length is SOLID,
+   otherwise BROKEN (dashed). The outermost lines are the road edges when no asphalt is seen beyond them.
 2. Zones: one road zone between the road edges (its width = lanes x --lane-width metres) and the solid lines between
    the edges as V5 lane lines (a curved line becomes a few short straight pieces). --include-broken also counts
    broken lines (any lane change), --include-edges the edge lines. Written to <out>/lanes.json (the format
    violation_tracker.py --zones reads) with a picture of what was found (<out>/lanes_detected.jpg).
-3. The violation pipeline (surveillance/pipeline.py, V5 only) runs on every frame; each violator's plate is read
-   with the web service's reader (service/plates.py: BLPD plate detector + our character model, voted over the
-   vehicle's 30 largest views).
+3. The violation pipeline (surveillance/pipeline.py, V5 only) runs on every frame, every vehicle measured in the
+   locked view (the empty road is the camera-movement reference); each violator's plate is read with the web
+   service's reader (service/plates.py: BLPD plate detector + our character model, voted over the vehicle's 30
+   largest views).
+4. Frame-by-frame check of the lock: once per video second the lane lines are mapped into the actual frame and the
+   share lying on paint seen in that frame is recorded (alignment.csv; each violation carries the latest value).
 
 Output in <out>: violations.csv + snapshots/ (scene and close-up per violation), plates.csv (one row per violation:
-plate read, status, plate image), plates/ (plate crops and "vehicle + plate" images), annotated.mp4, lanes.json,
-lanes_detected.jpg, background.jpg.
+plate read, status, plate image, lane alignment), plates/ (plate crops and "vehicle + plate" images), annotated.mp4,
+alignment.csv, lanes.json, lanes_detected.jpg, background.jpg.
 
 Plate detector: models/plate_models/LPD_Model.pt from https://github.com/prosensarker4/BLPD (not in this repo).
 """
@@ -50,10 +55,16 @@ def parse_args(argv=None):
     p.add_argument("--hold", type=float, default=0.5, help="V5: seconds on each side of the line")
     p.add_argument("--solid-coverage", type=float, default=0.75,
                    help="Share of a line's length that must be painted for it to be solid")
-    p.add_argument("--sample-sec", type=float, default=60.0, help="Lane detection: use the first N seconds")
+    p.add_argument("--sample-sec", type=float, default=0,
+                   help="Lane detection: use the first N seconds (0 = the whole video)")
     p.add_argument("--sample-frames", type=int, default=40, help="Lane detection: frames in the median")
+    p.add_argument("--ref-at", type=float, default=None,
+                   help="Video time (s) of the view the road is locked to (default: the middle of the video). "
+                        "Pick a moment showing the whole road: zoomed-in stretches are mapped into it")
     p.add_argument("--lanes-only", action="store_true", help="Detect the lanes, write lanes.json, then stop")
-    p.add_argument("--zones", default=None, help="Use this zone file instead of detecting lanes")
+    p.add_argument("--zones", default=None,
+                   help="Use this zone file instead of detecting lanes (e.g. an earlier run's lanes.json; its "
+                        "background.jpg next to it is used for the road lock)")
     p.add_argument("--imgsz", type=int, default=960, help="Vehicle detector input size")
     p.add_argument("--analysis-fps", type=float, default=30, help="Frames analysed per second")
     p.add_argument("--end", type=float, default=None, help="Stop at this video time (s)")
@@ -66,8 +77,12 @@ def parse_args(argv=None):
 
 # ---------------------------------------------------------------- 1. background (empty road)
 
-def build_background(path, model_path, imgsz, sample_sec, n_frames, log=print):
-    """(median picture of the road at WORK_W wide in the first frame's view, first frame at full resolution)."""
+def build_background(path, model_path, imgsz, sample_sec, n_frames, ref_at=None, log=print):
+    """Median picture of the empty road, WORK_W wide, in the view of the reference frame (the frame at `ref_at`
+    seconds; default: the middle of the sampled stretch). Frames spread over the first `sample_sec` seconds (0 = the
+    whole video) are each matched to the reference (surveillance/camera_motion.py, vehicles masked out) and warped
+    into its view, i.e. stabilised on the road; frames that cannot be matched are left out.
+    Returns (background, reference frame at WORK_W, full frame size (W, H), reference time)."""
     from ultralytics import YOLO
 
     from surveillance.camera_motion import CameraMotion
@@ -78,62 +93,70 @@ def build_background(path, model_path, imgsz, sample_sec, n_frames, log=print):
         raise SystemExit(f"Cannot open {path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    last = min(total or int(sample_sec * fps), int(sample_sec * fps))
-    step = max(1, last // max(1, n_frames))
+    last = total if not sample_sec else min(total or int(sample_sec * fps), int(sample_sec * fps))
+    ref_idx = int(last // 2 if ref_at is None else min(last - 1, max(0, ref_at * fps)))
+
+    def read(i):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, f = cap.read()
+        return f if ok else None
+
+    first = read(ref_idx)
+    if first is None:
+        raise SystemExit(f"Cannot read frame {ref_idx} of {path}")
+    H0, W0 = first.shape[:2]
+    k = WORK_W / W0
+
+    def small(f):
+        return cv2.resize(f, (WORK_W, round(f.shape[0] * k)), interpolation=cv2.INTER_AREA)
+
     device = pick_device()
     model = YOLO(str(model_path), task="detect")
-    ref = motion = None
-    k = 1.0
-    stack, masks = [], []
-    idx = 0
-    while idx < last:
-        if not cap.grab():
-            break
-        if idx % step:
-            idx += 1
+
+    def vehicles(img):
+        return model.predict(img, imgsz=imgsz, conf=0.15, verbose=False, device=device)[0].boxes.xyxy.tolist()
+
+    ref = small(first)
+    ref_boxes = vehicles(ref)
+    # the reference's own vehicles must not be matched: CameraMotion leaves its "zone" polygons out of the features
+    motion = CameraMotion(ref, [np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]) for x1, y1, x2, y2 in ref_boxes])
+    stack, masks, used = [], [], 0
+    indices = sorted(set(np.linspace(0, max(0, last - 1), max(2, n_frames)).astype(int).tolist()) | {ref_idx})
+    for i in indices:
+        frame = ref if i == ref_idx else read(i)
+        if frame is None:
             continue
-        ok, frame = cap.retrieve()
-        if not ok:
-            break
-        t = idx / fps
-        boxes = [b for b in model.predict(frame, imgsz=imgsz, conf=0.15, verbose=False, device=device)[0]
-                 .boxes.xyxy.tolist()]
-        if ref is None:
-            ref = frame.copy()
-            k = WORK_W / frame.shape[1]
-            motion = CameraMotion(ref)
+        if frame.shape[1] != WORK_W:
+            frame = small(frame)
+        t = i / fps
+        boxes = ref_boxes if i == ref_idx else vehicles(frame)
+        motion.anchor_due = None   # frames seconds apart: always match to the reference itself
         motion.update(frame, t, boxes)
-        if not motion.enforce:
-            idx += 1
+        if motion.last_ok_t != t:
+            log(f"  {t:5.1f}s: could not be matched to the reference view, left out")
             continue
-        H, W = frame.shape[:2]
-        small = cv2.resize(frame, (WORK_W, round(H * k)), interpolation=cv2.INTER_AREA)
-        veh = np.zeros(small.shape[:2], np.uint8)
+        veh = np.zeros(frame.shape[:2], np.uint8)
         for x1, y1, x2, y2 in boxes:
             pad = 0.04 * (x2 - x1)
-            cv2.rectangle(veh, (int((x1 - pad) * k), int((y1 - pad) * k)), (int((x2 + pad) * k), int((y2 + pad) * k)),
-                          255, -1)
-        A = motion.A.copy()
-        A[:, 2] *= k   # full-resolution -> work-resolution translation
-        size = (small.shape[1], small.shape[0])
-        warped = cv2.warpAffine(small, A, size, flags=cv2.INTER_LINEAR, borderValue=0)
-        valid = cv2.warpAffine(np.full(small.shape[:2], 255, np.uint8), A, size, flags=cv2.INTER_NEAREST)
-        veh = cv2.warpAffine(veh, A, size, flags=cv2.INTER_NEAREST)
-        stack.append(warped)
-        masks.append((valid > 0) & (veh == 0))
-        log(f"  background frame {len(stack)} at {t:5.1f}s: {len(boxes)} vehicles masked, camera {motion.state}")
-        idx += 1
+            cv2.rectangle(veh, (int(x1 - pad), int(y1 - pad)), (int(x2 + pad), int(y2 + pad)), 255, -1)
+        size = (frame.shape[1], frame.shape[0])
+        stack.append(cv2.warpAffine(frame, motion.A, size, flags=cv2.INTER_LINEAR, borderValue=0))
+        valid = cv2.warpAffine(np.full(frame.shape[:2], 255, np.uint8), motion.A, size, flags=cv2.INTER_NEAREST)
+        masks.append((valid > 0) & (cv2.warpAffine(veh, motion.A, size, flags=cv2.INTER_NEAREST) == 0))
+        used += 1
+        log(f"  {t:5.1f}s: {len(boxes)} vehicles masked, view shift {motion.shift_px:.0f} px, zoom {motion.zoom:.2f}")
     cap.release()
     if not stack:
-        raise SystemExit("No frames could be read for lane detection")
+        raise SystemExit("No frames could be matched for lane detection")
     data = np.stack(stack).astype(np.float32)
     data[~np.stack(masks)] = np.nan
     bg = np.nanmedian(data, axis=0)
-    # pixels covered by a vehicle in every frame: fall back to the plain median
+    # pixels covered by a vehicle (or outside the picture) in every frame: fall back to the plain median / reference
     holes = np.isnan(bg)
     if holes.any():
-        bg[holes] = np.median(np.stack(stack).astype(np.float32), axis=0)[holes]
-    return np.clip(bg, 0, 255).astype(np.uint8), ref
+        bg[holes] = ref.astype(np.float32)[holes]
+    log(f"  empty road from {used} of {len(indices)} frames, in the view at {ref_idx / fps:.1f}s")
+    return np.clip(bg, 0, 255).astype(np.uint8), ref, (W0, H0), ref_idx / fps
 
 
 # ---------------------------------------------------------------- 2. lane lines in the empty road
@@ -307,6 +330,46 @@ def classify_sections(lines, tophat, solid_coverage, row_step=2):
             else:
                 ln["sections"].append(sec)
     return [ln for ln in lines if ln["sections"]]
+
+
+def toward_vanishing_point(lines, shape, max_angle=15.0, log=print):
+    """Keeps the lines that run toward the road's vanishing point (where the long lines' near-end directions meet):
+    painted lane lines do, a row of people on the pavement or a pole does not."""
+    import itertools
+    import math
+
+    H, W = shape[:2]
+
+    def tangent(ln):
+        y = ln["y_bottom"] - 0.25 * (ln["y_bottom"] - ln["y_top"])   # the near part of the line
+        x = float(np.polyval(ln["coef"], y))
+        dxdy = float(np.polyval(np.polyder(ln["coef"]), y))
+        return np.array([x, y]), np.array([-dxdy, -1.0])               # pointing up the picture
+
+    major = [ln for ln in lines if ln["y_bottom"] - ln["y_top"] >= 0.4 * H]
+    meets = []
+    for a, b in itertools.combinations(major, 2):
+        (p1, d1), (p2, d2) = tangent(a), tangent(b)
+        m = np.array([d1, -d2]).T
+        if abs(np.linalg.det(m)) < 1e-6:
+            continue
+        s1, s2 = np.linalg.solve(m, p2 - p1)
+        if s1 > 0 and s2 > 0:
+            meets.append(p1 + s1 * d1)
+    if not meets:
+        return lines
+    vp = np.median(np.float64(meets), axis=0)
+    keep = []
+    for ln in lines:
+        p, d = tangent(ln)
+        to = vp - p
+        ang = math.degrees(math.acos(np.clip(d @ to / (np.linalg.norm(d) * np.linalg.norm(to) + 1e-9), -1, 1)))
+        if ang <= max_angle:
+            keep.append(ln)
+        else:
+            log(f"  left out a line at x={p[0]:.0f}, y={p[1]:.0f} (of {W}x{H}): it does not run along the road "
+                f"({ang:.0f} deg off)")
+    return keep
 
 
 def x_at(ln, y):
@@ -484,17 +547,18 @@ def draw_lanes(img_work, lines, cfg, k):
 
 def detect_lanes(args, out, log=print):
     log("Lane detection: building a picture of the empty road...")
-    bg, ref = build_background(args.source, VISION / "models" / "bd_vehicles_best.pt", args.imgsz,
-                               args.sample_sec, args.sample_frames, log=lambda m: None)
+    bg, small_ref, (W, H), ref_t = build_background(args.source, VISION / "models" / "bd_vehicles_best.pt",
+                                                     args.imgsz, args.sample_sec, args.sample_frames, args.ref_at,
+                                                     log=log)
     cv2.imwrite(str(out / "background.jpg"), bg)
     mask, tophat = paint_mask(bg)
     lines = fit_lines(trace_lines(mask), bg.shape)
     lines = classify_sections(lines, tophat, args.solid_coverage)
+    lines = toward_vanishing_point(lines, bg.shape, log=log)
     log(f"  {len(lines)} painted lines found")
-    H, W = ref.shape[:2]
     cfg = build_zones(bg, lines, (W, H), args.lane_width, args.include_broken, args.include_edges, log=log)
+    cfg["auto_lanes"]["reference_s"] = round(ref_t, 2)
     (out / "lanes.json").write_text(json.dumps(cfg, indent=2))
-    small_ref = cv2.resize(ref, (bg.shape[1], bg.shape[0]), interpolation=cv2.INTER_AREA)
     cv2.imwrite(str(out / "lanes_detected.jpg"), draw_lanes(small_ref, lines, cfg, bg.shape[1] / W))
     log(f"  {len(cfg['lane_lines'])} line pieces checked for crossing -> {out / 'lanes.json'}, "
         f"{out / 'lanes_detected.jpg'}")
@@ -526,6 +590,40 @@ def plate_writer(out, plate_rows, lock, log=print):
             plate_rows[key] = row
         log(f"\n[plate] {key}: {row['plate'] or '-'} ({row['plate_status']})")
     return on_result
+
+
+def line_points(camera, motion=None, n=24):
+    """Points along every checked lane line, in the current frame's pixels (zones are in the reference view)."""
+    pts = np.concatenate([np.linspace(ln.pts[0], ln.pts[1], n) for ln in camera.lines]).astype(np.float32)
+    return motion.to_frame(pts) if motion is not None else pts
+
+
+def paint_at(frame, pts, tol=6):
+    """Top-hat paint response next to each point (frame pixels; measured at WORK_W), NaN outside the picture."""
+    H, W = frame.shape[:2]
+    k = WORK_W / W
+    small = cv2.resize(frame, (WORK_W, round(H * k)), interpolation=cv2.INTER_AREA)
+    _, tophat = paint_mask(small)
+    out = np.full(len(pts), np.nan, np.float32)
+    for i, (x, y) in enumerate(pts * k):
+        xi, yi = int(round(x)), int(round(y))
+        if tol <= xi < small.shape[1] - tol and 0 <= yi < small.shape[0]:
+            out[i] = tophat[yi, xi - tol:xi + tol + 1].max()
+    return out
+
+
+def lane_alignment(frame, camera, motion, boxes, strength):
+    """Frame-by-frame check of the road lock: share of the lane-line points, mapped into this frame, that lie on
+    paint seen in this frame (points under a vehicle or outside the picture left out). None: too few to judge."""
+    pts = line_points(camera, motion)
+    free = np.ones(len(pts), bool)
+    for x1, y1, x2, y2 in boxes:
+        free &= ~((pts[:, 0] >= x1) & (pts[:, 0] <= x2) & (pts[:, 1] >= y1) & (pts[:, 1] <= y2))
+    v = paint_at(frame, pts)
+    ok = free & ~np.isnan(v)
+    if ok.sum() < 10:
+        return None
+    return round(float((v[ok] > max(12.0, 0.4 * strength)).mean()), 2)
 
 
 def run(args, zones_path, ref, out, log=print):
@@ -560,10 +658,32 @@ def run(args, zones_path, ref, out, log=print):
 
         plates = sp.WebPlateCollector(sp.PlateModels(), plate_writer(out, plate_rows, lock, log), live=False)
 
+    # A zoomed-in stretch of a handheld video shows only part of the road the zones were drawn on: keep checking
+    # the part in view instead of pausing (the frame-by-frame alignment check below watches the lock).
+    import surveillance.camera_motion as camera_motion
+    camera_motion.MIN_IN_VIEW = 0.2
     overrides = {"lane_line": {"margin_m": args.margin, "hold_sec": args.hold}}
     pipe = Pipeline(detector, camera, (source.width, source.height), None, False, None, overrides, ["V5"],
                     auto_roi=True, display_width=args.video_width, plates=plates, reference=ref,
                     stabilize=not args.no_stabilize)
+    if not args.no_stabilize and ref is not None:
+        # The road lock. The pipeline's own setup leaves the road zones out of the reference's features (for a fixed
+        # camera they are full of traffic), but the reference here is the EMPTY road: its paint and asphalt are the
+        # best features there are. Without them a handheld video's first 13 s could not be matched and were taken
+        # as "unverified, assume unmoved" (lines 0.1-0.5 on the paint), so: road features in, an unverified view
+        # is not trusted (a hand-held camera is never steady), and the clean reference is never swapped for a live
+        # frame (re-anchoring).
+        from concurrent.futures import ThreadPoolExecutor
+
+        class RoadLock(camera_motion.CameraMotion):
+            @property
+            def enforce(self):
+                return self.state in ("stable", "compensated")
+
+        camera_motion.REANCHOR_SEC = float("inf")
+        pipe.motion = RoadLock(ref, [r.poly for r in camera.roads] + [a.poly for a in camera.areas])
+        pipe.motion._set_reference(ref, [])
+        pipe._pool = ThreadPoolExecutor(1, thread_name_prefix="camera-motion")
     # Only sideways positions matter for V5, and the zone's length is nominal: trust positions in the whole zone.
     pipe.reliable_y = {id(r): 0.0 for r in camera.roads}
     for r in camera.roads:
@@ -576,6 +696,9 @@ def run(args, zones_path, ref, out, log=print):
     evidence = EvidenceWriter(out)
     writer, raw_video = None, out / "annotated_raw.mp4"
     events = []
+    # paint strength of the lines in the reference view (the empty road), for the alignment check
+    strength = float(np.nanmedian(paint_at(ref, line_points(camera)))) if ref is not None else 40.0
+    align_rows, last_align, every = [], None, max(1, round(source.fps))
     frames, t0, last_print = 0, time.time(), 0.0
     try:
         while True:
@@ -587,12 +710,22 @@ def run(args, zones_path, ref, out, log=print):
                 break
             res = pipe.process(frame, t)
             frames += 1
+            if frames % every == 1 or every == 1:
+                m = pipe.motion
+                if m is not None and not m.enforce:
+                    last_align = None
+                else:
+                    last_align = lane_alignment(frame, camera, m, pipe._boxes, strength)
+                d = m.describe() if m is not None else {}
+                align_rows.append({"video_time_s": round(t, 2), "camera": d.get("state", "fixed"),
+                                   "shift_px": d.get("shift_px", 0), "zoom": d.get("zoom", 1),
+                                   "lines_on_paint": "" if last_align is None else last_align})
             for ev in res.events:
                 ev_frame = frame
                 if ev.frame is not None:
                     ev_frame = cv2.imdecode(np.frombuffer(ev.frame, np.uint8), cv2.IMREAD_COLOR)
                 stem = evidence.write(ev, ev_frame)
-                events.append((stem, ev))
+                events.append((stem, ev, last_align))
                 if plates:
                     plates.request(ev.obs.tid, stem, t)
                 log(f"\n[{ev.code}] {ev.obs.cls} #{ev.obs.tid} crossed {ev.details.get('line')} at {t:.1f}s")
@@ -621,21 +754,32 @@ def run(args, zones_path, ref, out, log=print):
         writer.release()
         finish_video(raw_video, out / "annotated.mp4", log)
 
-    fields = ["id", "violation", "track_id", "class", "video_time_s", "line", "plate", "plate_status",
+    with open(out / "alignment.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["video_time_s", "camera", "shift_px", "zoom", "lines_on_paint"])
+        w.writeheader()
+        w.writerows(align_rows)
+    scores = [r["lines_on_paint"] for r in align_rows if r["lines_on_paint"] != ""]
+    if scores:
+        bad = [r["video_time_s"] for r in align_rows if r["lines_on_paint"] != "" and r["lines_on_paint"] < 0.6]
+        log(f"Road lock check (alignment.csv): lane lines on the paint in {np.mean(scores):.0%} of the points on "
+            f"average; {len(bad)} of {len(scores)} checked seconds below 60%"
+            + (f" (at {', '.join(f'{b:.0f}s' for b in bad[:15])}{' ...' if len(bad) > 15 else ''})" if bad else ""))
+    fields = ["id", "violation", "track_id", "class", "video_time_s", "line", "lane_alignment", "plate", "plate_status",
               "plate_confidence", "agreeing_reads", "reads", "plate_px", "snapshot", "closeup", "plate_image",
               "vehicle_plate_image"]
     with open(out / "plates.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
-        for stem, ev in events:
+        for stem, ev, align in events:
             row = {"id": stem, "violation": f"{ev.code} {ev.title}", "track_id": ev.obs.tid, "class": ev.obs.cls,
                    "video_time_s": round(ev.obs.time_s, 2), "line": ev.details.get("line", ""),
+                   "lane_alignment": "" if align is None else align,
                    "snapshot": f"snapshots/{stem}.jpg", "closeup": f"snapshots/{stem}_crop.jpg",
                    **plate_rows.get(stem, {"plate_status": "not read" if plates else "plates off"})}
             w.writerow(row)
     log(f"\nFrames: {frames} | avg {frames / max(1e-6, time.time() - t0):.1f} FPS")
     log(f"===== LANE-LINE VIOLATIONS ({len(events)}) =====")
-    for stem, ev in events:
+    for stem, ev, _ in events:
         r = plate_rows.get(stem, {})
         log(f"{stem}: {ev.obs.cls} #{ev.obs.tid} at {ev.obs.time_s:.1f}s, line {ev.details.get('line')}, "
             f"plate {r.get('plate') or '-'} ({r.get('plate_status', 'not read')})")
@@ -667,6 +811,10 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     if args.zones:
         zones_path, ref = Path(args.zones), None
+        bg = cv2.imread(str(zones_path.parent / "background.jpg"))   # saved with a lane detection: the road lock
+        if bg is not None:
+            W, H = json.loads(zones_path.read_text())["frame_size"]
+            ref = cv2.resize(bg, (W, H), interpolation=cv2.INTER_CUBIC)
     else:
         zones_path, ref = detect_lanes(args, out)
     if args.lanes_only:
